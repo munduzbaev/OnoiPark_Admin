@@ -3,3 +3,5 @@ node_modules
 dist
 .env.local
 .env
+09_claude_code_dashboard_gate.md
+admin-output.md
