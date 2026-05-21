@@ -9,6 +9,7 @@ import ManualEntryPage from './pages/ManualEntryPage';
 import HistoryPage from './pages/HistoryPage';
 import SettingsPage from './pages/SettingsPage';
 import KPPMonitor from './pages/KPPMonitor';
+import GatePage from './pages/GatePage';
 // ...
 
 
@@ -18,11 +19,18 @@ export const router = createBrowserRouter([
     Component: LoginPage,
   },
   {
+    path: '/monitor',
+    Component: KPPMonitor,
+  },
+  {
+    path: '/gate',
+    Component: GatePage,
+  },
+  {
     path: '/',
     Component: Layout,
     children: [
       { index: true, element: <Navigate to="/dashboard" replace /> },
-      { path: '/monitor', element: <KPPMonitor /> },
       { path: 'dashboard', Component: DashboardPage },
       { path: 'parkings', Component: ParkingsPage },
       { path: 'sessions', Component: SessionsPage },
