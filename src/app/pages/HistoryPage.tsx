@@ -172,7 +172,7 @@ export default function HistoryPage() {
               <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
               <XAxis dataKey="date" tick={{ fontSize: 11, fill: '#94a3b8' }} />
               <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} />
-              <Tooltip content={<CHART_TOOLTIP />} />
+              <Tooltip content={<CHART_TOOLTIP />} cursor={false} />
               <Legend wrapperStyle={{ fontSize: 12, color: '#94a3b8' }}
                 formatter={v => v === 'revenue' ? 'Выручка (с)' : 'Сессии'} />
               <Line
@@ -199,7 +199,7 @@ export default function HistoryPage() {
               <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
               <XAxis dataKey="name" tick={{ fontSize: 11, fill: '#94a3b8' }} />
               <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} />
-              <Tooltip content={<CHART_TOOLTIP />} />
+              <Tooltip content={<CHART_TOOLTIP />} cursor={false} />
               <Legend wrapperStyle={{ fontSize: 12, color: '#94a3b8' }}
                 formatter={v => v === 'sessions' ? 'Сессии' : 'Выручка (с)'} />
               <Bar dataKey="sessions" fill="#10b981" radius={[4, 4, 0, 0]} name="sessions" />

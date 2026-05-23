@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { ParkingSquare, Activity, MapPin, TrendingUp, RefreshCw } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  CartesianGrid, Legend
+  CartesianGrid
 } from 'recharts';
 import { api } from '../lib/api';
 import { useApp } from '../contexts/AppContext';
@@ -38,14 +38,13 @@ function StatCardComp({ title, value, icon: Icon, color, bg }: StatCardProps) {
 
 const CHART_TOOLTIP = ({ active, payload, label }: any) => {
   if (!active || !payload?.length) return null;
+  const d = payload[0]?.payload;
   return (
     <div className="bg-slate-800 border border-slate-700 rounded-lg p-3 text-sm">
       <p className="text-white font-medium mb-1">{label}</p>
-      {payload.map((p: any) => (
-        <p key={p.name} style={{ color: p.color }}>
-          {p.name === 'occupied' ? 'Занято' : 'Свободно'}: {p.value}
-        </p>
-      ))}
+      <p style={{ color: payload[0]?.color }}>
+        Занято: {d?.occupied} из {d?.total} ({d?.occupancyPct}%)
+      </p>
     </div>
   );
 };
@@ -113,11 +112,16 @@ export default function DashboardPage() {
     .filter(h => new Date(h.endTime || h.startTime).toDateString() === new Date().toDateString())
     .reduce((s, h) => s + (h.cost || 0), 0);
 
-  const chartData = parkings.map(p => ({
-    name: p.name?.substring(0, 12) || '–',
-    occupied: (p.totalSpots || 0) - (p.availableSpots || 0),
-    available: p.availableSpots || 0,
-  }));
+  const chartData = parkings.map(p => {
+    const total = p.totalSpots || 0;
+    const occupied = total - (p.availableSpots || 0);
+    return {
+      name: p.name?.substring(0, 12) || '–',
+      occupancyPct: total > 0 ? Math.round(occupied / total * 100) : 0,
+      occupied,
+      total,
+    };
+  });
 
   const stats: StatCardProps[] = [
     {
@@ -190,23 +194,23 @@ export default function DashboardPage() {
           <h2 className="text-base font-semibold text-slate-900 dark:text-white mb-4">
             Заполненность парковок
           </h2>
-          {chartData.every(d => d.occupied === 0 && d.available === 0) ? (
+          {chartData.every(d => d.total === 0) ? (
             <div className="flex items-center justify-center h-40 text-slate-400 text-sm">
               Данные о занятости недоступны
             </div>
           ) : (
             <ResponsiveContainer width="100%" height={220}>
-              <BarChart data={chartData} margin={{ top: 0, right: 0, left: -10, bottom: 0 }}>
+              <BarChart data={chartData} margin={{ top: 0, right: 10, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
                 <XAxis dataKey="name" tick={{ fontSize: 12, fill: '#94a3b8' }} />
-                <YAxis tick={{ fontSize: 12, fill: '#94a3b8' }} />
-                <Tooltip content={<CHART_TOOLTIP />} />
-                <Legend
-                  formatter={(value) => (value === 'occupied' ? 'Занято' : 'Свободно')}
-                  wrapperStyle={{ fontSize: 12, color: '#94a3b8' }}
+                <YAxis
+                  domain={[0, 100]}
+                  ticks={[0, 25, 50, 75, 100]}
+                  tickFormatter={(v) => `${v}%`}
+                  tick={{ fontSize: 12, fill: '#94a3b8' }}
                 />
-                <Bar dataKey="occupied" fill="#ef4444" radius={[4, 4, 0, 0]} />
-                <Bar dataKey="available" fill="#10b981" radius={[4, 4, 0, 0]} />
+                <Tooltip content={<CHART_TOOLTIP />} cursor={false} />
+                <Bar dataKey="occupancyPct" fill="#ef4444" radius={[4, 4, 0, 0]} minPointSize={2} />
               </BarChart>
             </ResponsiveContainer>
           )}
