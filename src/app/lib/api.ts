@@ -69,9 +69,9 @@ export const api = {
   cancelBooking: (data: object) =>
     apiFetch<any>('/bookings/cancel', { method: 'POST', body: JSON.stringify(data) }),
 
-  // History
+  // History (admin endpoint — returns all users' completed sessions)
   getHistory: (params?: string) =>
-    apiFetch<{ history: any[] }>(`/history${params ? '?' + params : ''}`).then(r =>
+    apiFetch<{ history: any[] }>(`/admin/history${params ? '?' + params : ''}`).then(r =>
       Array.isArray((r as any).history) ? (r as any).history : (r as any)
     ),
   getAllUsers: () => apiFetch<any[]>('/history/all'),

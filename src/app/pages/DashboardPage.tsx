@@ -110,7 +110,7 @@ export default function DashboardPage() {
   const totalSpots = parkings.reduce((s, p) => s + (p.totalSpots || 0), 0);
   const availableSpots = parkings.reduce((s, p) => s + (p.availableSpots || 0), 0);
   const todayCost = history
-    .filter(h => new Date(h.startTime || h.endTime).toDateString() === new Date().toDateString())
+    .filter(h => new Date(h.endTime || h.startTime).toDateString() === new Date().toDateString())
     .reduce((s, h) => s + (h.cost || 0), 0);
 
   const chartData = parkings.map(p => ({
