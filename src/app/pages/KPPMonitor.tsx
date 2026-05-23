@@ -1,55 +1,46 @@
 /**
- * KPPMonitor.tsx — Монитор КПП (Контрольно-Пропускной Пункт)
+ * KPPMonitor.tsx — Monitor screen mounted above the barrier.
  *
- * Эта страница открывается на большом экране у въезда/выезда парковки.
- * Подключается к Supabase Realtime и автоматически показывает:
- *  - "Добро пожаловать!" когда машина заезжает
- *  - "До свидания!" когда машина выезжает
- *  - Госномер и имя водителя
- *  - Время и текущие данные о заполненности
+ * Primary display: free spots count (large, colour-coded).
+ * Secondary: clock + date.
+ * Entry/exit events: plate + driver name overlay (8 s, then returns to idle).
  *
- * URL: /monitor  (добавить в routes.tsx)
- * Пример: https://onoipark-admin.vercel.app/monitor
- *
- * УСТАНОВКА:
- * 1. Скопируй этот файл в src/app/pages/KPPMonitor.tsx
- * 2. Добавь маршрут в src/app/routes.tsx:
- *      { path: '/monitor', element: <KPPMonitor /> }
- * 3. Добавь в sidebar пункт "Монитор" со ссылкой на /monitor
- *    (или просто открывай напрямую в браузере на большом экране)
+ * URL: /monitor?parking=<id>   (defaults to parking-1)
  */
 
 import { useEffect, useState, useRef } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import React from 'react';
 
-// ── Supabase connection ──────────────────────────────────────────────────────
+// ── Supabase ─────────────────────────────────────────────────────────────────
 const SUPABASE_URL = 'https://rhckohqfbvkeinsqyesh.supabase.co';
 const SUPABASE_ANON_KEY =
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJoY2tvaHFmYnZrZWluc3F5ZXNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEzNzkxNTAsImV4cCI6MjA3Njk1NTE1MH0.1yDwTdLJV1titZ7V-GzEQb-2e64FxFT-Me3PiqRCfBg';
-const API_BASE = `${SUPABASE_URL}/functions/v1/make-server-8d1a5612`;
+const PARKING_API = 'https://onoipark-api.vercel.app/api';
+
+// Read parking id from URL query param, fall back to parking-1
+const parkingId =
+  new URLSearchParams(window.location.search).get('parking') || 'parking-1';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// ── Types ────────────────────────────────────────────────────────────────────
-type EventType = 'entry' | 'exit' | 'idle';
+// ── Types ─────────────────────────────────────────────────────────────────────
+type EventType = 'entry' | 'exit';
 
 interface ParkingEvent {
   type: EventType;
   plateNumber: string;
   driverName?: string;
-  parkingName?: string;
   spotNumber?: number;
   timestamp: string;
 }
 
-interface ParkingStats {
-  totalSpots: number;
-  availableSpots: number;
-  parkingName: string;
+interface SpotsInfo {
+  free: number;
+  total: number;
 }
 
-// ── Helper ───────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function formatTime(date: Date) {
   return date.toLocaleTimeString('ru-RU', {
     hour: '2-digit',
@@ -66,134 +57,117 @@ function formatDate(date: Date) {
   });
 }
 
-// ── Main component ───────────────────────────────────────────────────────────
+// ── Component ─────────────────────────────────────────────────────────────────
 export default function KPPMonitor() {
   const [currentEvent, setCurrentEvent] = useState<ParkingEvent | null>(null);
-  const [stats, setStats] = useState<ParkingStats | null>(null);
+  const [spotsInfo, setSpotsInfo] = useState<SpotsInfo | null>(null);
   const [clock, setClock] = useState(new Date());
   const [isConnected, setIsConnected] = useState(false);
-
-  // Auto-clear event after 8 seconds back to idle
   const clearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ── Clock tick ──────────────────────────────────────────────────────────
+  // ── Clock ────────────────────────────────────────────────────────────────
   useEffect(() => {
-    const interval = setInterval(() => setClock(new Date()), 1000);
-    return () => clearInterval(interval);
+    const id = setInterval(() => setClock(new Date()), 1000);
+    return () => clearInterval(id);
   }, []);
 
-  // ── Load parking stats ──────────────────────────────────────────────────
-  const loadStats = async () => {
+  // ── Fetch free spots ─────────────────────────────────────────────────────
+  const loadSpots = async () => {
     try {
-      const res = await fetch(`${API_BASE}/parkings`);
+      const res = await fetch(`${PARKING_API}/parkings/${parkingId}/spots`);
       const data = await res.json();
-      if (data.parkings?.length) {
-        const p = data.parkings[0];
-        setStats({
-          totalSpots: p.totalSpots,
-          availableSpots: p.availableSpots,
-          parkingName: p.name,
-        });
-      }
+      const spots: any[] = data.spots || [];
+      setSpotsInfo({
+        free: spots.filter((s: any) => s.status === 'available').length,
+        total: spots.length,
+      });
     } catch {
-      // Silently ignore — monitor still works offline
+      // silently ignore — stale display is acceptable
     }
   };
 
+  // Initial fetch + polling fallback every 10 s
   useEffect(() => {
-    loadStats();
-    const interval = setInterval(loadStats, 30000);
-    return () => clearInterval(interval);
+    loadSpots();
+    const id = setInterval(loadSpots, 10000);
+    return () => clearInterval(id);
   }, []);
 
-  // ── Supabase Realtime subscription ──────────────────────────────────────
+  // ── Realtime: parking_sessions → re-fetch spots on any change ────────────
   useEffect(() => {
-    // Subscribe to KV store changes — when a session starts or ends,
-    // the kv_store_8d1a5612 table is updated and we catch it here.
     const channel = supabase
-      .channel('kpp-monitor')
+      .channel('monitor-sessions')
       .on(
         'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'kv_store_8d1a5612',
-        },
-        (payload) => {
-          handleKVChange(payload);
-        }
+        { event: '*', schema: 'public', table: 'parking_sessions' },
+        () => { loadSpots(); }
       )
-      .subscribe((status) => {
-        setIsConnected(status === 'SUBSCRIBED');
-      });
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
+      .subscribe(status => setIsConnected(status === 'SUBSCRIBED'));
+    return () => { supabase.removeChannel(channel); };
   }, []);
 
-  // ── Handle incoming realtime event ──────────────────────────────────────
+  // ── Realtime: kv_store for entry/exit event overlay ──────────────────────
+  useEffect(() => {
+    const channel = supabase
+      .channel('kpp-events')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'kv_store_8d1a5612' },
+        (payload) => { handleKVChange(payload); }
+      )
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, []);
+
   const handleKVChange = (payload: any) => {
     const key: string = payload.new?.key || payload.old?.key || '';
     const value = payload.new?.value;
-
-    // Session started: key = "session:session-TIMESTAMP"
-    if (key.startsWith('session:') && payload.eventType === 'INSERT') {
-      const session = value;
-      if (session?.status === 'active') {
-        showEvent({
-          type: 'entry',
-          plateNumber: session.plateNumber || '–',
-          driverName: session.driverName || session.name,
-          spotNumber: session.spotNumber,
-          timestamp: new Date().toISOString(),
-        });
-        loadStats();
-      }
+    if (key.startsWith('session:') && payload.eventType === 'INSERT' && value?.status === 'active') {
+      showEvent({
+        type: 'entry',
+        plateNumber: value.plateNumber || '–',
+        driverName: value.driverName || value.name,
+        spotNumber: value.spotNumber,
+        timestamp: new Date().toISOString(),
+      });
+      loadSpots();
     }
-
-    // Session ended: key = "session:...", status becomes 'completed'
-    if (key.startsWith('session:') && payload.eventType === 'UPDATE') {
-      const session = value;
-      if (session?.status === 'completed') {
-        showEvent({
-          type: 'exit',
-          plateNumber: session.plateNumber || '–',
-          driverName: session.driverName || session.name,
-          spotNumber: session.spotNumber,
-          timestamp: new Date().toISOString(),
-        });
-        loadStats();
-      }
-    }
-
-    // user-session deleted = exit
-    if (key.startsWith('user-session:') && payload.eventType === 'DELETE') {
-      loadStats();
+    if (key.startsWith('session:') && payload.eventType === 'UPDATE' && value?.status === 'completed') {
+      showEvent({
+        type: 'exit',
+        plateNumber: value.plateNumber || '–',
+        driverName: value.driverName || value.name,
+        spotNumber: value.spotNumber,
+        timestamp: new Date().toISOString(),
+      });
+      loadSpots();
     }
   };
 
   const showEvent = (event: ParkingEvent) => {
     setCurrentEvent(event);
     if (clearTimer.current) clearTimeout(clearTimer.current);
-    clearTimer.current = setTimeout(() => {
-      setCurrentEvent(null);
-    }, 8000);
+    clearTimer.current = setTimeout(() => setCurrentEvent(null), 8000);
   };
 
-  // ── Render ───────────────────────────────────────────────────────────────
+  // ── Derived ───────────────────────────────────────────────────────────────
   const isEntry = currentEvent?.type === 'entry';
-  const isExit = currentEvent?.type === 'exit';
   const hasEvent = currentEvent !== null;
 
+  // Free-spots colour: green → amber (≤2) → red (0)
+  const freeColor =
+    spotsInfo === null ? '#64748b'
+    : spotsInfo.free === 0 ? '#ef4444'
+    : spotsInfo.free <= 2 ? '#f59e0b'
+    : '#10b981';
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div
       style={{
         minHeight: '100vh',
         background: hasEvent
-          ? isEntry
-            ? '#f0fdf4'
-            : '#fff7ed'
+          ? isEntry ? '#f0fdf4' : '#fff7ed'
           : '#f8fafc',
         display: 'flex',
         flexDirection: 'column',
@@ -206,32 +180,19 @@ export default function KPPMonitor() {
         padding: '40px',
       }}
     >
-      {/* Animated background circles */}
-      <div style={{
-        position: 'absolute',
-        inset: 0,
-        overflow: 'hidden',
-        pointerEvents: 'none',
-      }}>
+      {/* Decorative background circles */}
+      <div style={{ position: 'absolute', inset: 0, overflow: 'hidden', pointerEvents: 'none' }}>
         <div style={{
-          position: 'absolute',
-          width: '600px',
-          height: '600px',
-          borderRadius: '50%',
-          top: '-200px',
-          left: '-200px',
+          position: 'absolute', width: '600px', height: '600px', borderRadius: '50%',
+          top: '-200px', left: '-200px',
           background: hasEvent
             ? isEntry ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.10)'
             : 'rgba(59,130,246,0.10)',
           transition: 'background 0.6s ease',
         }} />
         <div style={{
-          position: 'absolute',
-          width: '400px',
-          height: '400px',
-          borderRadius: '50%',
-          bottom: '-100px',
-          right: '-100px',
+          position: 'absolute', width: '400px', height: '400px', borderRadius: '50%',
+          bottom: '-100px', right: '-100px',
           background: hasEvent
             ? isEntry ? 'rgba(16,185,129,0.08)' : 'rgba(239,68,68,0.07)'
             : 'rgba(99,102,241,0.08)',
@@ -239,19 +200,10 @@ export default function KPPMonitor() {
         }} />
       </div>
 
-      {/* Connection status dot */}
-      <div style={{
-        position: 'absolute',
-        top: '24px',
-        right: '24px',
-        display: 'flex',
-        alignItems: 'center',
-        gap: '8px',
-      }}>
+      {/* Connection status */}
+      <div style={{ position: 'absolute', top: '24px', right: '24px', display: 'flex', alignItems: 'center', gap: '8px' }}>
         <div style={{
-          width: '10px',
-          height: '10px',
-          borderRadius: '50%',
+          width: '10px', height: '10px', borderRadius: '50%',
           background: isConnected ? '#10b981' : '#6b7280',
           boxShadow: isConnected ? '0 0 8px #10b981' : 'none',
           animation: isConnected ? 'pulse 2s infinite' : 'none',
@@ -261,222 +213,133 @@ export default function KPPMonitor() {
         </span>
       </div>
 
-      {/* Logo top-left */}
+      {/* Logo */}
       <div style={{ position: 'absolute', top: '24px', left: '32px' }}>
-        <span style={{
-          fontSize: '22px',
-          fontWeight: 800,
-          letterSpacing: '-0.5px',
-          color: '#0f172a',
-        }}>
+        <span style={{ fontSize: '22px', fontWeight: 800, letterSpacing: '-0.5px', color: '#0f172a' }}>
           Onoi<span style={{ color: '#10b981' }}>Park</span>
         </span>
       </div>
 
       {/* Main content */}
-      <div style={{
-        textAlign: 'center',
-        zIndex: 1,
-        animation: hasEvent ? 'fadeIn 0.4s ease' : undefined,
-      }}>
+      <div style={{ textAlign: 'center', zIndex: 1, animation: hasEvent ? 'fadeIn 0.4s ease' : undefined }}>
 
-        {/* EVENT STATE */}
+        {/* ── EVENT STATE ─────────────────────────────────────────────────── */}
         {hasEvent && currentEvent ? (
           <>
-            {/* Big icon */}
-            <div style={{
-              fontSize: '80px',
-              marginBottom: '24px',
-              lineHeight: 1,
-            }}>
+            <div style={{ fontSize: '80px', marginBottom: '24px', lineHeight: 1 }}>
               {isEntry ? '🚗' : '👋'}
             </div>
-
-            {/* Main greeting */}
             <div style={{
-              fontSize: 'clamp(48px, 8vw, 96px)',
-              fontWeight: 800,
-              letterSpacing: '-2px',
-              lineHeight: 1.05,
+              fontSize: 'clamp(48px, 8vw, 96px)', fontWeight: 800, letterSpacing: '-2px',
+              lineHeight: 1.05, marginBottom: '24px',
               color: isEntry ? '#10b981' : '#f59e0b',
-              marginBottom: '24px',
               textShadow: isEntry
                 ? '0 0 60px rgba(16,185,129,0.3)'
                 : '0 0 60px rgba(245,158,11,0.3)',
             }}>
               {isEntry ? 'Добро пожаловать!' : 'До свидания!'}
             </div>
-
-            {/* Plate number — big */}
             <div style={{
-              fontSize: 'clamp(36px, 6vw, 72px)',
-              fontWeight: 800,
-              letterSpacing: '4px',
-              fontFamily: 'monospace',
-              color: '#f0f0f8',
+              fontSize: 'clamp(36px, 6vw, 72px)', fontWeight: 800, letterSpacing: '4px',
+              fontFamily: 'monospace', color: '#0f172a',
               background: 'rgba(255,255,255,0.92)',
               border: `2px solid ${isEntry ? '#10b981' : '#f59e0b'}`,
-              borderRadius: '16px',
-              padding: '16px 40px',
-              display: 'inline-block',
-              marginBottom: '20px',
+              borderRadius: '16px', padding: '16px 40px',
+              display: 'inline-block', marginBottom: '20px',
               boxShadow: '0 10px 30px rgba(15,23,42,0.08)',
             }}>
               {currentEvent.plateNumber}
             </div>
-
-            {/* Driver name if available */}
             {currentEvent.driverName && (
               <div style={{
-                fontSize: 'clamp(20px, 3vw, 36px)',
-                color: '#94a3b8',
-                textShadow: '0 1px 0 rgba(255,255,255,0.6)',
-                marginBottom: '16px',
-                fontWeight: 500,
+                fontSize: 'clamp(20px, 3vw, 36px)', color: '#94a3b8',
+                marginBottom: '16px', fontWeight: 500,
               }}>
                 {currentEvent.driverName}
               </div>
             )}
-
-            {/* Spot number if available */}
             {currentEvent.spotNumber && isEntry && (
-              <div style={{
-                fontSize: '18px',
-                color: '#64748b',
-                marginTop: '8px',
-              }}>
+              <div style={{ fontSize: '18px', color: '#64748b', marginTop: '8px' }}>
                 Место №{currentEvent.spotNumber}
               </div>
             )}
           </>
         ) : (
-          /* IDLE STATE */
+          /* ── IDLE STATE ───────────────────────────────────────────────── */
           <>
-            <div style={{
-              fontSize: 'clamp(14px, 2vw, 20px)',
-              color: '#475569',
-              letterSpacing: '4px',
-              textTransform: 'uppercase',
-              marginBottom: '16px',
-              fontFamily: 'monospace',
-            }}>
-              Система готова
-            </div>
-
-            <div style={{
-              fontSize: 'clamp(36px, 6vw, 80px)',
-              fontWeight: 800,
-              letterSpacing: '-2px',
-              color: '#1e293b',
-              marginBottom: '8px',
-            }}>
-              {formatTime(clock)}
-            </div>
-
-            <div style={{
-              fontSize: 'clamp(14px, 2vw, 22px)',
-              color: '#334155',
-              marginBottom: '48px',
-              textTransform: 'capitalize',
-            }}>
-              {formatDate(clock)}
-            </div>
-
-            {/* Parking stats */}
-            {stats && (
+            {/* PRIMARY: free spots */}
+            <div style={{ marginBottom: '48px' }}>
               <div style={{
-                display: 'flex',
-                gap: '32px',
-                justifyContent: 'center',
-                flexWrap: 'wrap',
+                fontSize: 'clamp(13px, 1.8vw, 18px)',
+                color: '#475569',
+                letterSpacing: '4px',
+                textTransform: 'uppercase',
+                fontFamily: 'monospace',
+                marginBottom: '12px',
               }}>
-                <div style={{
-                  background: 'rgba(16,185,129,0.08)',
-                  border: '1px solid rgba(16,185,129,0.2)',
-                  borderRadius: '16px',
-                  padding: '24px 40px',
-                  textAlign: 'center',
-                }}>
-                  <div style={{
-                    fontSize: 'clamp(32px, 5vw, 64px)',
-                    fontWeight: 800,
-                    color: '#10b981',
-                    lineHeight: 1,
-                    marginBottom: '8px',
-                  }}>
-                    {stats.availableSpots}
-                  </div>
-                  <div style={{ color: '#64748b', fontSize: '14px', letterSpacing: '1px' }}>
-                    СВОБОДНО
-                  </div>
-                </div>
-
-                <div style={{
-                  background: 'rgba(239,68,68,0.08)',
-                  border: '1px solid rgba(239,68,68,0.2)',
-                  borderRadius: '16px',
-                  padding: '24px 40px',
-                  textAlign: 'center',
-                }}>
-                  <div style={{
-                    fontSize: 'clamp(32px, 5vw, 64px)',
-                    fontWeight: 800,
-                    color: '#ef4444',
-                    lineHeight: 1,
-                    marginBottom: '8px',
-                  }}>
-                    {stats.totalSpots - stats.availableSpots}
-                  </div>
-                  <div style={{ color: '#64748b', fontSize: '14px', letterSpacing: '1px' }}>
-                    ЗАНЯТО
-                  </div>
-                </div>
-
-                <div style={{
-                  background: 'rgba(99,102,241,0.08)',
-                  border: '1px solid rgba(99,102,241,0.2)',
-                  borderRadius: '16px',
-                  padding: '24px 40px',
-                  textAlign: 'center',
-                }}>
-                  <div style={{
-                    fontSize: 'clamp(32px, 5vw, 64px)',
-                    fontWeight: 800,
-                    color: '#818cf8',
-                    lineHeight: 1,
-                    marginBottom: '8px',
-                  }}>
-                    {stats.totalSpots}
-                  </div>
-                  <div style={{ color: '#64748b', fontSize: '14px', letterSpacing: '1px' }}>
-                    ВСЕГО МЕСТ
-                  </div>
-                </div>
+                СВОБОДНЫХ МЕСТ
               </div>
-            )}
 
+              <div style={{
+                fontSize: 'clamp(96px, 18vw, 200px)',
+                fontWeight: 900,
+                lineHeight: 1,
+                color: freeColor,
+                transition: 'color 0.4s ease',
+              }}>
+                {spotsInfo !== null ? spotsInfo.free : '–'}
+              </div>
+
+              {spotsInfo !== null && (
+                <div style={{
+                  fontSize: 'clamp(16px, 2.5vw, 28px)',
+                  color: '#94a3b8',
+                  marginTop: '8px',
+                }}>
+                  из {spotsInfo.total}
+                </div>
+              )}
+            </div>
+
+            {/* SECONDARY: clock + date */}
+            <div style={{ marginBottom: '32px' }}>
+              <div style={{
+                fontSize: 'clamp(28px, 4.5vw, 56px)',
+                fontWeight: 700,
+                letterSpacing: '-1px',
+                color: '#1e293b',
+              }}>
+                {formatTime(clock)}
+              </div>
+              <div style={{
+                fontSize: 'clamp(13px, 1.8vw, 20px)',
+                color: '#475569',
+                marginTop: '4px',
+                textTransform: 'capitalize',
+              }}>
+                {formatDate(clock)}
+              </div>
+            </div>
+
+            {/* Branding */}
             <div style={{
-              marginTop: '48px',
-              color: '#1e293b',
-              fontSize: '16px',
+              fontSize: '14px',
+              color: '#94a3b8',
               letterSpacing: '2px',
               textTransform: 'uppercase',
             }}>
-              {stats?.parkingName || 'OnoiPark'}
+              Система готова · OnoiPark
             </div>
           </>
         )}
       </div>
 
-      {/* Bottom: scan instruction */}
+      {/* Bottom instruction */}
       {!hasEvent && (
         <div style={{
-          position: 'absolute',
-          bottom: '32px',
-          textAlign: 'center',
-          color: '#1e293b',
-          fontSize: '15px',
-          letterSpacing: '1px',
+          position: 'absolute', bottom: '32px',
+          textAlign: 'center', color: '#94a3b8',
+          fontSize: '14px', letterSpacing: '1px',
         }}>
           Отсканируйте QR-код в мобильном приложении OnoiPark
         </div>
