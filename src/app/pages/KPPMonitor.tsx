@@ -1,14 +1,14 @@
 /**
  * KPPMonitor.tsx — Monitor screen mounted above the barrier.
  *
- * Primary display: free spots count (large, colour-coded).
- * Secondary: clock + date.
- * Entry/exit events: plate + driver name overlay (8 s, then returns to idle).
+ * Primary display: free spots count (large, colour-coded) + clock.
+ * Event overlay: on entry (status→active) shows GREEN "ДОСТУП РАЗРЕШЁН" + plate + spot for 5 s,
+ *                on exit (status→exiting/completed) shows BLUE "ВЫЕЗД" + plate + spot for 5 s.
  *
  * URL: /monitor?parking=<id>   (defaults to parking-1)
  */
 
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import React from 'react';
 
@@ -18,7 +18,6 @@ const SUPABASE_ANON_KEY =
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJoY2tvaHFmYnZrZWluc3F5ZXNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEzNzkxNTAsImV4cCI6MjA3Njk1NTE1MH0.1yDwTdLJV1titZ7V-GzEQb-2e64FxFT-Me3PiqRCfBg';
 const PARKING_API = 'https://onoipark-api.vercel.app/api';
 
-// Read parking id from URL query param, fall back to parking-1
 const parkingId =
   new URLSearchParams(window.location.search).get('parking') || 'parking-1';
 
@@ -57,6 +56,24 @@ function formatDate(date: Date) {
   });
 }
 
+async function resolveProfile(
+  userId: string
+): Promise<{ plate: string | null; name: string | null }> {
+  try {
+    const { data } = await supabase
+      .from('profiles')
+      .select('plate_number, name')
+      .eq('id', userId)
+      .single();
+    return {
+      plate: data?.plate_number || null,
+      name: data?.name || null,
+    };
+  } catch {
+    return { plate: null, name: null };
+  }
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function KPPMonitor() {
   const [currentEvent, setCurrentEvent] = useState<ParkingEvent | null>(null);
@@ -72,7 +89,7 @@ export default function KPPMonitor() {
   }, []);
 
   // ── Fetch free spots ─────────────────────────────────────────────────────
-  const loadSpots = async () => {
+  const loadSpots = useCallback(async () => {
     try {
       const res = await fetch(`${PARKING_API}/parkings/${parkingId}/spots`);
       const data = await res.json();
@@ -82,99 +99,111 @@ export default function KPPMonitor() {
         total: spots.length,
       });
     } catch {
-      // silently ignore — stale display is acceptable
+      // stale display is acceptable
     }
-  };
+  }, []);
 
   // Initial fetch + polling fallback every 10 s
   useEffect(() => {
     loadSpots();
     const id = setInterval(loadSpots, 10000);
     return () => clearInterval(id);
+  }, [loadSpots]);
+
+  // ── Show overlay event, reset 5 s timer ──────────────────────────────────
+  const showEvent = useCallback((event: ParkingEvent) => {
+    setCurrentEvent(event);
+    if (clearTimer.current) clearTimeout(clearTimer.current);
+    clearTimer.current = setTimeout(() => setCurrentEvent(null), 5000);
   }, []);
 
-  // ── Realtime: parking_sessions → re-fetch spots on any change ────────────
+  // ── Realtime: parking_sessions → spots refresh + entry/exit overlay ───────
   useEffect(() => {
     const channel = supabase
       .channel('monitor-sessions')
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'parking_sessions' },
-        () => { loadSpots(); }
+        {
+          event: '*',
+          schema: 'public',
+          table: 'parking_sessions',
+          filter: `parking_id=eq.${parkingId}`,
+        },
+        async (payload) => {
+          loadSpots();
+
+          const ev = payload.eventType;
+          const row = payload.new as any;
+          if (!row) return;
+
+          if (row.status === 'active' && (ev === 'INSERT' || ev === 'UPDATE')) {
+            // Entry
+            const { plate, name } = await resolveProfile(row.user_id);
+            showEvent({
+              type: 'entry',
+              plateNumber: plate || '–',
+              driverName: name || undefined,
+              spotNumber: row.spot_number,
+              timestamp: new Date().toISOString(),
+            });
+          } else if (
+            (row.status === 'exiting' || row.status === 'completed') &&
+            ev === 'UPDATE'
+          ) {
+            // Exit
+            const { plate, name } = await resolveProfile(row.user_id);
+            showEvent({
+              type: 'exit',
+              plateNumber: plate || '–',
+              driverName: name || undefined,
+              spotNumber: row.spot_number,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
       )
-      .subscribe(status => setIsConnected(status === 'SUBSCRIBED'));
-    return () => { supabase.removeChannel(channel); };
-  }, []);
+      .subscribe((status) => setIsConnected(status === 'SUBSCRIBED'));
 
-  // ── Realtime: kv_store for entry/exit event overlay ──────────────────────
-  useEffect(() => {
-    const channel = supabase
-      .channel('kpp-events')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'kv_store_8d1a5612' },
-        (payload) => { handleKVChange(payload); }
-      )
-      .subscribe();
-    return () => { supabase.removeChannel(channel); };
-  }, []);
-
-  const handleKVChange = (payload: any) => {
-    const key: string = payload.new?.key || payload.old?.key || '';
-    const value = payload.new?.value;
-    if (key.startsWith('session:') && payload.eventType === 'INSERT' && value?.status === 'active') {
-      showEvent({
-        type: 'entry',
-        plateNumber: value.plateNumber || '–',
-        driverName: value.driverName || value.name,
-        spotNumber: value.spotNumber,
-        timestamp: new Date().toISOString(),
-      });
-      loadSpots();
-    }
-    if (key.startsWith('session:') && payload.eventType === 'UPDATE' && value?.status === 'completed') {
-      showEvent({
-        type: 'exit',
-        plateNumber: value.plateNumber || '–',
-        driverName: value.driverName || value.name,
-        spotNumber: value.spotNumber,
-        timestamp: new Date().toISOString(),
-      });
-      loadSpots();
-    }
-  };
-
-  const showEvent = (event: ParkingEvent) => {
-    setCurrentEvent(event);
-    if (clearTimer.current) clearTimeout(clearTimer.current);
-    clearTimer.current = setTimeout(() => setCurrentEvent(null), 8000);
-  };
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [loadSpots, showEvent]);
 
   // ── Derived ───────────────────────────────────────────────────────────────
   const isEntry = currentEvent?.type === 'entry';
   const hasEvent = currentEvent !== null;
 
-  // Free-spots colour: green → amber (≤2) → red (0)
   const freeColor =
-    spotsInfo === null ? '#64748b'
-    : spotsInfo.free === 0 ? '#ef4444'
-    : spotsInfo.free <= 2 ? '#f59e0b'
-    : '#10b981';
+    spotsInfo === null
+      ? '#64748b'
+      : spotsInfo.free === 0
+        ? '#ef4444'
+        : spotsInfo.free <= 2
+          ? '#f59e0b'
+          : '#10b981';
+
+  // Entry = green, Exit = blue
+  const overlayAccent = isEntry ? '#10b981' : '#3b82f6';
+  const overlayBg = isEntry ? '#f0fdf4' : '#eff6ff';
+  const overlayBgCircle1 = isEntry
+    ? 'rgba(16,185,129,0.12)'
+    : 'rgba(59,130,246,0.12)';
+  const overlayBgCircle2 = isEntry
+    ? 'rgba(16,185,129,0.08)'
+    : 'rgba(59,130,246,0.08)';
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div
       style={{
         minHeight: '100vh',
-        background: hasEvent
-          ? isEntry ? '#f0fdf4' : '#fff7ed'
-          : '#f8fafc',
+        background: hasEvent ? overlayBg : '#f8fafc',
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
         justifyContent: 'center',
         fontFamily: "'Syne', 'Inter', sans-serif",
-        transition: 'background 0.6s ease',
+        transition: 'background 0.4s ease',
         position: 'relative',
         overflow: 'hidden',
         padding: '40px',
@@ -185,18 +214,14 @@ export default function KPPMonitor() {
         <div style={{
           position: 'absolute', width: '600px', height: '600px', borderRadius: '50%',
           top: '-200px', left: '-200px',
-          background: hasEvent
-            ? isEntry ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.10)'
-            : 'rgba(59,130,246,0.10)',
-          transition: 'background 0.6s ease',
+          background: hasEvent ? overlayBgCircle1 : 'rgba(59,130,246,0.10)',
+          transition: 'background 0.4s ease',
         }} />
         <div style={{
           position: 'absolute', width: '400px', height: '400px', borderRadius: '50%',
           bottom: '-100px', right: '-100px',
-          background: hasEvent
-            ? isEntry ? 'rgba(16,185,129,0.08)' : 'rgba(239,68,68,0.07)'
-            : 'rgba(99,102,241,0.08)',
-          transition: 'background 0.6s ease',
+          background: hasEvent ? overlayBgCircle2 : 'rgba(99,102,241,0.08)',
+          transition: 'background 0.4s ease',
         }} />
       </div>
 
@@ -206,7 +231,7 @@ export default function KPPMonitor() {
           width: '10px', height: '10px', borderRadius: '50%',
           background: isConnected ? '#10b981' : '#6b7280',
           boxShadow: isConnected ? '0 0 8px #10b981' : 'none',
-          animation: isConnected ? 'pulse 2s infinite' : 'none',
+          animation: isConnected ? 'blink 2s infinite' : 'none',
         }} />
         <span style={{ color: '#4b5563', fontSize: '13px' }}>
           {isConnected ? 'Подключено' : 'Нет связи'}
@@ -221,51 +246,68 @@ export default function KPPMonitor() {
       </div>
 
       {/* Main content */}
-      <div style={{ textAlign: 'center', zIndex: 1, animation: hasEvent ? 'fadeIn 0.4s ease' : undefined }}>
+      <div style={{ textAlign: 'center', zIndex: 1 }}>
 
-        {/* ── EVENT STATE ─────────────────────────────────────────────────── */}
+        {/* ── EVENT OVERLAY ──────────────────────────────────────────────── */}
         {hasEvent && currentEvent ? (
-          <>
-            <div style={{ fontSize: '80px', marginBottom: '24px', lineHeight: 1 }}>
-              {isEntry ? '🚗' : '👋'}
-            </div>
+          <div style={{ animation: 'fadeIn 0.35s ease' }}>
+            {/* Headline */}
             <div style={{
-              fontSize: 'clamp(48px, 8vw, 96px)', fontWeight: 800, letterSpacing: '-2px',
-              lineHeight: 1.05, marginBottom: '24px',
-              color: isEntry ? '#10b981' : '#f59e0b',
-              textShadow: isEntry
-                ? '0 0 60px rgba(16,185,129,0.3)'
-                : '0 0 60px rgba(245,158,11,0.3)',
+              fontSize: 'clamp(28px, 5vw, 64px)',
+              fontWeight: 900,
+              letterSpacing: '2px',
+              textTransform: 'uppercase',
+              color: overlayAccent,
+              marginBottom: '32px',
+              textShadow: `0 0 60px ${overlayAccent}44`,
             }}>
-              {isEntry ? 'Добро пожаловать!' : 'До свидания!'}
+              {isEntry ? 'ДОСТУП РАЗРЕШЁН' : 'ВЫЕЗД'}
             </div>
+
+            {/* Plate number */}
             <div style={{
-              fontSize: 'clamp(36px, 6vw, 72px)', fontWeight: 800, letterSpacing: '4px',
-              fontFamily: 'monospace', color: '#0f172a',
-              background: 'rgba(255,255,255,0.92)',
-              border: `2px solid ${isEntry ? '#10b981' : '#f59e0b'}`,
-              borderRadius: '16px', padding: '16px 40px',
-              display: 'inline-block', marginBottom: '20px',
-              boxShadow: '0 10px 30px rgba(15,23,42,0.08)',
+              fontSize: 'clamp(40px, 8vw, 100px)',
+              fontWeight: 800,
+              letterSpacing: '6px',
+              fontFamily: 'monospace',
+              color: '#0f172a',
+              background: 'rgba(255,255,255,0.95)',
+              border: `3px solid ${overlayAccent}`,
+              borderRadius: '20px',
+              padding: '20px 48px',
+              display: 'inline-block',
+              marginBottom: '28px',
+              boxShadow: `0 12px 40px ${overlayAccent}22`,
+              animation: isEntry ? 'pulse 1.5s ease-in-out infinite' : undefined,
             }}>
               {currentEvent.plateNumber}
             </div>
+
+            {/* Spot number */}
+            {currentEvent.spotNumber != null && (
+              <div style={{
+                fontSize: 'clamp(20px, 3.5vw, 42px)',
+                fontWeight: 700,
+                color: overlayAccent,
+                marginBottom: '16px',
+              }}>
+                Место №{currentEvent.spotNumber}
+              </div>
+            )}
+
+            {/* Driver name */}
             {currentEvent.driverName && (
               <div style={{
-                fontSize: 'clamp(20px, 3vw, 36px)', color: '#94a3b8',
-                marginBottom: '16px', fontWeight: 500,
+                fontSize: 'clamp(16px, 2.5vw, 30px)',
+                color: '#64748b',
+                fontWeight: 500,
               }}>
                 {currentEvent.driverName}
               </div>
             )}
-            {currentEvent.spotNumber && isEntry && (
-              <div style={{ fontSize: '18px', color: '#64748b', marginTop: '8px' }}>
-                Место №{currentEvent.spotNumber}
-              </div>
-            )}
-          </>
+          </div>
         ) : (
-          /* ── IDLE STATE ───────────────────────────────────────────────── */
+          /* ── IDLE STATE ────────────────────────────────────────────────── */
           <>
             {/* PRIMARY: free spots */}
             <div style={{ marginBottom: '48px' }}>
@@ -346,13 +388,17 @@ export default function KPPMonitor() {
       )}
 
       <style>{`
-        @keyframes pulse {
+        @keyframes blink {
           0%, 100% { opacity: 1; }
           50% { opacity: 0.4; }
         }
         @keyframes fadeIn {
-          from { opacity: 0; transform: translateY(20px); }
+          from { opacity: 0; transform: translateY(16px); }
           to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes pulse {
+          0%, 100% { box-shadow: 0 12px 40px ${overlayAccent}22; }
+          50% { box-shadow: 0 12px 60px ${overlayAccent}55; }
         }
       `}</style>
     </div>
