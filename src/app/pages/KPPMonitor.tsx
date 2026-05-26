@@ -5,14 +5,19 @@
  * Event overlay: on entry (status→active) shows GREEN "ДОСТУП РАЗРЕШЁН" + plate + spot for 5 s,
  *                on exit (status→exiting/completed) shows BLUE "ВЫЕЗД" + plate + spot for 5 s.
  *
+ * Plate/name resolution: via API (/admin/sessions/all) — NOT direct Supabase REST (406).
+ * Requires the operator to open /monitor in a browser where the admin is logged in.
+ * Falls back to spot + direction only when the token is absent or the API returns 401/403.
+ *
  * URL: /monitor?parking=<id>   (defaults to parking-1)
  */
 
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import React from 'react';
+import { api } from '../lib/api';
 
-// ── Supabase ─────────────────────────────────────────────────────────────────
+// ── Supabase (realtime + free-spots only) ────────────────────────────────────
 const SUPABASE_URL = 'https://rhckohqfbvkeinsqyesh.supabase.co';
 const SUPABASE_ANON_KEY =
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJoY2tvaHFmYnZrZWluc3F5ZXNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEzNzkxNTAsImV4cCI6MjA3Njk1NTE1MH0.1yDwTdLJV1titZ7V-GzEQb-2e64FxFT-Me3PiqRCfBg';
@@ -31,12 +36,19 @@ interface ParkingEvent {
   plateNumber: string;
   driverName?: string;
   spotNumber?: number;
+  cost?: number;
   timestamp: string;
 }
 
 interface SpotsInfo {
   free: number;
   total: number;
+}
+
+interface CachedSession {
+  plate: string;
+  name?: string;
+  spot?: number;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -56,24 +68,6 @@ function formatDate(date: Date) {
   });
 }
 
-async function resolveProfile(
-  userId: string
-): Promise<{ plate: string | null; name: string | null }> {
-  try {
-    const { data } = await supabase
-      .from('profiles')
-      .select('plate_number, name')
-      .eq('id', userId)
-      .single();
-    return {
-      plate: data?.plate_number || null,
-      name: data?.name || null,
-    };
-  } catch {
-    return { plate: null, name: null };
-  }
-}
-
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function KPPMonitor() {
   const [currentEvent, setCurrentEvent] = useState<ParkingEvent | null>(null);
@@ -81,6 +75,8 @@ export default function KPPMonitor() {
   const [clock, setClock] = useState(new Date());
   const [isConnected, setIsConnected] = useState(false);
   const clearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Cache plate/name per session id so EXIT can reuse what was fetched at ENTRY
+  const sessionCache = useRef<Map<string, CachedSession>>(new Map());
 
   // ── Clock ────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -103,7 +99,6 @@ export default function KPPMonitor() {
     }
   }, []);
 
-  // Initial fetch + polling fallback every 10 s
   useEffect(() => {
     loadSpots();
     const id = setInterval(loadSpots, 10000);
@@ -115,6 +110,54 @@ export default function KPPMonitor() {
     setCurrentEvent(event);
     if (clearTimer.current) clearTimeout(clearTimer.current);
     clearTimer.current = setTimeout(() => setCurrentEvent(null), 5000);
+  }, []);
+
+  // ── Resolve plate/name for ENTRY via /admin/sessions/all ─────────────────
+  const resolveEntry = useCallback(async (sessionId: string, fallbackSpot?: number): Promise<CachedSession | null> => {
+    try {
+      const sessions: any[] = await api.getActiveSessions();
+      const match = sessions.find((s: any) => s.id === sessionId);
+      if (match) {
+        const cached: CachedSession = {
+          plate: match.plateNumber || '',
+          name: match.driverName || undefined,
+          spot: match.spotNumber ?? fallbackSpot,
+        };
+        sessionCache.current.set(sessionId, cached);
+        return cached;
+      }
+    } catch (err) {
+      console.warn('[Monitor] Could not resolve plate via API (no token / 401?):', err);
+    }
+    return null;
+  }, []);
+
+  // ── Resolve plate/name for EXIT — cache first, then history ──────────────
+  const resolveExit = useCallback(async (
+    sessionId: string,
+    fallbackSpot?: number,
+    cost?: number,
+  ): Promise<CachedSession | null> => {
+    // Try cache from the corresponding ENTRY event
+    const cached = sessionCache.current.get(sessionId);
+    if (cached) return { ...cached, spot: cached.spot ?? fallbackSpot };
+
+    // Session may no longer be in active list; try history
+    try {
+      const result: any = await api.getHistory();
+      const list: any[] = Array.isArray(result) ? result : result.history || [];
+      const match = list.find((s: any) => s.id === sessionId);
+      if (match) {
+        return {
+          plate: match.plateNumber || '',
+          name: match.driverName || undefined,
+          spot: match.spotNumber ?? fallbackSpot,
+        };
+      }
+    } catch (err) {
+      console.warn('[Monitor] Could not resolve exit plate via history:', err);
+    }
+    return null;
   }, []);
 
   // ── Realtime: parking_sessions → spots refresh + entry/exit overlay ───────
@@ -136,27 +179,31 @@ export default function KPPMonitor() {
           const row = payload.new as any;
           if (!row) return;
 
+          const sessionId: string = row.id || '';
+          const fallbackSpot: number | undefined = row.spot_number ?? undefined;
+
           if (row.status === 'active' && (ev === 'INSERT' || ev === 'UPDATE')) {
-            // Entry
-            const { plate, name } = await resolveProfile(row.user_id);
+            const info = await resolveEntry(sessionId, fallbackSpot);
             showEvent({
               type: 'entry',
-              plateNumber: plate || '–',
-              driverName: name || undefined,
-              spotNumber: row.spot_number,
+              plateNumber: info?.plate || '',
+              driverName: info?.name,
+              spotNumber: info?.spot ?? fallbackSpot,
               timestamp: new Date().toISOString(),
             });
           } else if (
             (row.status === 'exiting' || row.status === 'completed') &&
             ev === 'UPDATE'
           ) {
-            // Exit
-            const { plate, name } = await resolveProfile(row.user_id);
+            const cost: number | undefined =
+              row.cost != null ? parseFloat(row.cost) : undefined;
+            const info = await resolveExit(sessionId, fallbackSpot, cost);
             showEvent({
               type: 'exit',
-              plateNumber: plate || '–',
-              driverName: name || undefined,
-              spotNumber: row.spot_number,
+              plateNumber: info?.plate || '',
+              driverName: info?.name,
+              spotNumber: info?.spot ?? fallbackSpot,
+              cost,
               timestamp: new Date().toISOString(),
             });
           }
@@ -167,7 +214,7 @@ export default function KPPMonitor() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [loadSpots, showEvent]);
+  }, [loadSpots, showEvent, resolveEntry, resolveExit]);
 
   // ── Derived ───────────────────────────────────────────────────────────────
   const isEntry = currentEvent?.type === 'entry';
@@ -182,7 +229,6 @@ export default function KPPMonitor() {
           ? '#f59e0b'
           : '#10b981';
 
-  // Entry = green, Exit = blue
   const overlayAccent = isEntry ? '#10b981' : '#3b82f6';
   const overlayBg = isEntry ? '#f0fdf4' : '#eff6ff';
   const overlayBgCircle1 = isEntry
@@ -191,6 +237,9 @@ export default function KPPMonitor() {
   const overlayBgCircle2 = isEntry
     ? 'rgba(16,185,129,0.08)'
     : 'rgba(59,130,246,0.08)';
+
+  // Plate display: if empty → show only spot + direction (graceful fallback)
+  const hasPlate = Boolean(currentEvent?.plateNumber);
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -264,24 +313,26 @@ export default function KPPMonitor() {
               {isEntry ? 'ДОСТУП РАЗРЕШЁН' : 'ВЫЕЗД'}
             </div>
 
-            {/* Plate number */}
-            <div style={{
-              fontSize: 'clamp(40px, 8vw, 100px)',
-              fontWeight: 800,
-              letterSpacing: '6px',
-              fontFamily: 'monospace',
-              color: '#0f172a',
-              background: 'rgba(255,255,255,0.95)',
-              border: `3px solid ${overlayAccent}`,
-              borderRadius: '20px',
-              padding: '20px 48px',
-              display: 'inline-block',
-              marginBottom: '28px',
-              boxShadow: `0 12px 40px ${overlayAccent}22`,
-              animation: isEntry ? 'pulse 1.5s ease-in-out infinite' : undefined,
-            }}>
-              {currentEvent.plateNumber}
-            </div>
+            {/* Plate number — only if resolved */}
+            {hasPlate && (
+              <div style={{
+                fontSize: 'clamp(40px, 8vw, 100px)',
+                fontWeight: 800,
+                letterSpacing: '6px',
+                fontFamily: 'monospace',
+                color: '#0f172a',
+                background: 'rgba(255,255,255,0.95)',
+                border: `3px solid ${overlayAccent}`,
+                borderRadius: '20px',
+                padding: '20px 48px',
+                display: 'inline-block',
+                marginBottom: '28px',
+                boxShadow: `0 12px 40px ${overlayAccent}22`,
+                animation: isEntry ? 'platePulse 1.5s ease-in-out infinite' : undefined,
+              }}>
+                {currentEvent.plateNumber}
+              </div>
+            )}
 
             {/* Spot number */}
             {currentEvent.spotNumber != null && (
@@ -301,8 +352,20 @@ export default function KPPMonitor() {
                 fontSize: 'clamp(16px, 2.5vw, 30px)',
                 color: '#64748b',
                 fontWeight: 500,
+                marginBottom: '12px',
               }}>
                 {currentEvent.driverName}
+              </div>
+            )}
+
+            {/* Cost on exit */}
+            {!isEntry && currentEvent.cost != null && currentEvent.cost > 0 && (
+              <div style={{
+                fontSize: 'clamp(16px, 2.5vw, 28px)',
+                color: '#64748b',
+                fontWeight: 500,
+              }}>
+                {currentEvent.cost.toFixed(0)} сом
               </div>
             )}
           </div>
@@ -396,9 +459,9 @@ export default function KPPMonitor() {
           from { opacity: 0; transform: translateY(16px); }
           to { opacity: 1; transform: translateY(0); }
         }
-        @keyframes pulse {
-          0%, 100% { box-shadow: 0 12px 40px ${overlayAccent}22; }
-          50% { box-shadow: 0 12px 60px ${overlayAccent}55; }
+        @keyframes platePulse {
+          0%, 100% { box-shadow: 0 12px 40px rgba(16,185,129,0.13); }
+          50% { box-shadow: 0 12px 60px rgba(16,185,129,0.35); }
         }
       `}</style>
     </div>
